@@ -1,15 +1,16 @@
 {
   "id": "filmmodu.nuvio.plugins",
   "name": "Filmmodu Plugin",
-  "logo": "https://www.google.com/s2/favicons?domain=filmmodu.cc&sz=128",
-  "version": "1.0.7",
+  "logo": "https://www.google.com/s2/favicons?domain=filmmodu.one&sz=128",
+  "version": "1.1.0",
   "author": "Bymesut",
   "scrapers": [
     {
       "id": "filmmodu",
       "name": "Filmmodu",
-      "logo": "https://www.google.com/s2/favicons?domain=filmmodu.cc&sz=%size%",
-      "version": "1.0.7",
+      "description": "filmmodu.one üzerinden Türkçe dublaj ve altyazılı filmler (yedek: filmmodu.live)",
+      "logo": "https://www.google.com/s2/favicons?domain=filmmodu.one&sz=%size%",
+      "version": "1.1.0",
       "filename": "providers/filmmodu.js",
       "supportedTypes": [
         "movie"
