@@ -202,10 +202,31 @@ function unpackPacked(src) {
   return p.replace(/\b\w+\b/g, function (w) { return d[w] !== undefined ? d[w] : w; });
 }
 
-// Metin içinde yayın listesi adresi arar (/m3u/KOD, .m3u8, master.txt)
+// Metin içinde yayın adresi arar: /m3u/KOD, .m3u8, master.txt, /api/stream.php?v=...&token=...
+// ve son çare olarak "file"/"src" alanlarındaki ilk medya adresi
 function findStreamInText(text) {
-  var m = String(text || '').match(/https?:\/\/[^"'\s\\<>]+?(?:\/m3u\/[A-Za-z0-9+\/=_\-]{20,}|\.m3u8[^"'\s\\<>]*|master\.txt[^"'\s\\<>]*)/);
-  return m ? m[0] : '';
+  text = String(text || '').replace(/\\u0026/gi, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  var m = text.match(/https?:\/\/[^"'\s\\<>]+?\/api\/stream\.php\?[^"'\s\\<>]+/);
+  if (m) return m[0];
+  m = text.match(/https?:\/\/[^"'\s\\<>]+?(?:\/m3u\/[A-Za-z0-9+\/=_\-]{20,}|\.m3u8[^"'\s\\<>]*|master\.txt[^"'\s\\<>]*)/);
+  if (m) return m[0];
+  var re = /["']?(?:file|src|source|hls|stream)["']?\s*[:=]\s*["'](https?:\/\/[^"'\s\\<>]+)["']/gi, g;
+  while ((g = re.exec(text)) !== null) {
+    if (/\.(js|css|png|jpe?g|gif|webp|svg|ico|woff2?|vtt|srt)(\?|$)/i.test(g[1])) continue;
+    if (/jquery|jwplatform|jsdelivr|cdnbye|googleapis|gstatic|google/i.test(g[1])) continue;
+    return g[1];
+  }
+  return '';
+}
+
+// Yayın adresindeki token'dan (JSON) izin verilen kaynak sitesini ("o") okur
+function tokenOrigin(url) {
+  var m = String(url || '').match(/[?&]token=([A-Za-z0-9_\-]+)\./);
+  if (!m) return '';
+  try {
+    var j = JSON.parse(decodeB64(m[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return j && j.o ? String(j.o) : '';
+  } catch (e) { return ''; }
 }
 
 // Oynatıcıdan taze (süreli) yayın adresini alır:
@@ -256,6 +277,7 @@ async function resolvePlayer(player, pageUrl) {
 
   return {
     url: url,
+    origin: tokenOrigin(url),
     headers: { 'User-Agent': ANDROID_UA, 'Referer': base + '/', 'Origin': base }
   };
 }
@@ -268,7 +290,8 @@ function discoverEmbed(player, e) {
   function count(re) { return (t.match(re) || []).length; }
   var lines = ['embed ' + player.host + ' HTTP ' + e.status + ', ' + raw.length + ' bayt, m3u:' + count(/\/m3u\//g) +
     ' m3u8:' + count(/m3u8/g) + ' file:' + count(/file\s*[:=]/g) + ' fetch:' + count(/fetch\(/g) +
-    ' open:' + count(/\.open\(/g) + ' eval:' + count(/eval\(/g) + ' atob:' + count(/atob\(/g) + (unp ? ' paketli' : '')];
+    ' open:' + count(/\.open\(/g) + ' eval:' + count(/eval\(/g) + ' atob:' + count(/atob\(/g) +
+    ' stream.php:' + count(/stream\.php/g) + ' pilav:' + count(/pilavyer/g) + (unp ? ' paketli' : '')];
   if (raw.length < 700) lines.push('ham: ' + raw.replace(/\s+/g, ' ').slice(0, 200));
   function ctx(label, re, n, before, after) {
     var m, k = 0;
@@ -281,7 +304,8 @@ function discoverEmbed(player, e) {
   ctx('open', /\.open\(/g, 2, 30, 170);
   ctx('ajax', /(?:\$\.(?:post|get|ajax)|axios)/g, 2, 20, 170);
   ctx('file', /file\s*[:=]/g, 2, 40, 150);
-  (t.match(/<script[^>]+src=["'][^"']+["']/g) || []).slice(0, 3).forEach(function (x) { lines.push('js: ' + x.slice(0, 190)); });
+  var inl = t.match(/<script(?![^>]*\ssrc=)[^>]*>[\s\S]*?<\/script>/gi) || [];
+  inl.slice(0, 3).forEach(function (x, i) { lines.push('script' + (i + 1) + ': ' + x.replace(/\s+/g, ' ').slice(0, 200)); });
   return lines.slice(0, 11).map(function (l) { return debugStream(l)[0]; });
 }
 
@@ -300,12 +324,17 @@ function makeVariants(r, tag) {
       headers: headers
     };
   }
-  return [
+  var list = [
     mk('', 'hls', h),
-    mk(' (.m3u8 ek)', 'hls', slim, tagged),
     mk(' (başlıksız)', 'hls', {}),
-    mk(' (m3u8)', 'm3u8', slim)
+    mk(' (m3u8)', 'm3u8', slim),
+    mk(' (.m3u8 ek)', 'hls', slim, tagged)
   ];
+  if (r.origin) {
+    var oh = { 'User-Agent': ANDROID_UA, 'Referer': 'https://' + r.origin + '/', 'Origin': 'https://' + r.origin };
+    list.splice(1, 0, mk(' (' + r.origin + ')', 'hls', oh));
+  }
+  return list;
 }
 
 // Listeyi başlıklı ve başlıksız çekip durum/içerik özeti çıkarır
