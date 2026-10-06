@@ -2,14 +2,14 @@
   "id": "filmmodu.nuvio.plugins",
   "name": "Filmmodu Plugin",
   "logo": "https://www.google.com/s2/favicons?domain=filmmodu.cc&sz=128",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "author": "Bymesut",
   "scrapers": [
     {
       "id": "filmmodu",
       "name": "Filmmodu",
       "logo": "https://www.google.com/s2/favicons?domain=filmmodu.cc&sz=%size%",
-      "version": "1.0.6",
+      "version": "1.0.7",
       "filename": "providers/filmmodu.js",
       "supportedTypes": [
         "movie"
