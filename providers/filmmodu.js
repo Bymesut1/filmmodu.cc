@@ -188,35 +188,68 @@ function extractEmbeds(html) {
   return out;
 }
 
-// Oynatıcının getVideo servisinden taze (süreli) HLS adresini alır
+// p.a.c.k.e.r ile sıkıştırılmış JS'i açar
+function unpackPacked(src) {
+  var m = String(src || '').match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\)/);
+  if (!m) return '';
+  var p = m[1].replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+  var a = parseInt(m[2], 10), c = parseInt(m[3], 10), k = m[4].split('|');
+  function enc(n) {
+    return (n < a ? '' : enc(Math.floor(n / a))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
+  }
+  var d = {};
+  while (c--) d[enc(c)] = k[c] || enc(c);
+  return p.replace(/\b\w+\b/g, function (w) { return d[w] !== undefined ? d[w] : w; });
+}
+
+// Metin içinde yayın listesi adresi arar (/m3u/KOD, .m3u8, master.txt)
+function findStreamInText(text) {
+  var m = String(text || '').match(/https?:\/\/[^"'\s\\<>]+?(?:\/m3u\/[A-Za-z0-9+\/=_\-]{20,}|\.m3u8[^"'\s\\<>]*|master\.txt[^"'\s\\<>]*)/);
+  return m ? m[0] : '';
+}
+
+// Oynatıcıdan taze (süreli) yayın adresini alır:
+//  1) gömme sayfasını (/embed/KİMLİK) açıp içinden arar
+//  2) olmazsa /player/index.php?data=KİMLİK&do=getVideo servisini dener
 async function resolvePlayer(player, pageUrl) {
   var base = 'https://' + player.host;
-  var r = await req(base + '/player/index.php?data=' + player.id + '&do=getVideo', {
-    method: 'POST',
+  var e = await req(base + '/embed/' + player.id, {
     headers: {
       'User-Agent': ANDROID_UA,
-      'Accept': 'application/json, text/javascript, */*; q=0.01',
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'X-Requested-With': 'XMLHttpRequest',
-      'Origin': base,
-      'Referer': base + '/embed/' + player.id
-    },
-    body: 'hash=' + player.id + '&r=' + encodeURIComponent(pageUrl)
+      'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+      'Accept-Language': 'tr-TR,tr;q=0.9',
+      'Referer': PRIMARY_DOMAIN + '/'
+    }
   });
-
-  var url = '';
-  try {
-    var j = JSON.parse(r.text);
-    url = j.securedLink || j.videoSource || '';
-  } catch (e) {}
+  var plain = e.text.replace(/\\\//g, '/').replace(/&amp;/g, '&');
+  var url = findStreamInText(plain);
   if (!url) {
-    var clean = r.text.replace(/\\\//g, '/');
-    var m = clean.match(/https?:\/\/[^"'\s\\]+?(?:master\.(?:txt|m3u8)|\/m3u\/)[^"'\s\\]*/);
-    if (m) url = m[0];
+    var unp = unpackPacked(plain);
+    if (unp) url = findStreamInText(unp);
+  }
+
+  var gv = null;
+  if (!url) {
+    gv = await req(base + '/player/index.php?data=' + player.id + '&do=getVideo', {
+      method: 'POST',
+      headers: {
+        'User-Agent': ANDROID_UA,
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': base,
+        'Referer': base + '/embed/' + player.id
+      },
+      body: 'hash=' + player.id + '&r=' + encodeURIComponent(pageUrl)
+    });
+    try {
+      var j = JSON.parse(gv.text);
+      url = j.securedLink || j.videoSource || '';
+    } catch (er) {}
+    if (!url) url = findStreamInText(gv.text.replace(/\\\//g, '/'));
   }
   if (!url) {
-    return { error: 'getVideo HTTP ' + r.status + (r.err ? ' ' + r.err : '') + ' ' +
-                    r.text.replace(/\s+/g, ' ').slice(0, 90) };
+    return { error: 'embed HTTP ' + e.status + ', getVideo HTTP ' + (gv ? gv.status : '-'), embed: e, player: player };
   }
   url = url.replace(/\\\//g, '/');
   if (url.indexOf('http') !== 0) url = base + (url.charAt(0) === '/' ? '' : '/') + url;
@@ -225,6 +258,31 @@ async function resolvePlayer(player, pageUrl) {
     url: url,
     headers: { 'User-Agent': ANDROID_UA, 'Referer': base + '/', 'Origin': base }
   };
+}
+
+// Gömme sayfasında link bulunamazsa: sayfanın video yükleme kodunu kısa satırlarla gösterir
+function discoverEmbed(player, e) {
+  var raw = String(e.text || '').replace(/\\\//g, '/');
+  var t = raw, unp = unpackPacked(raw);
+  if (unp) t += '\n' + unp;
+  function count(re) { return (t.match(re) || []).length; }
+  var lines = ['embed ' + player.host + ' HTTP ' + e.status + ', ' + raw.length + ' bayt, m3u:' + count(/\/m3u\//g) +
+    ' m3u8:' + count(/m3u8/g) + ' file:' + count(/file\s*[:=]/g) + ' fetch:' + count(/fetch\(/g) +
+    ' open:' + count(/\.open\(/g) + ' eval:' + count(/eval\(/g) + ' atob:' + count(/atob\(/g) + (unp ? ' paketli' : '')];
+  if (raw.length < 700) lines.push('ham: ' + raw.replace(/\s+/g, ' ').slice(0, 200));
+  function ctx(label, re, n, before, after) {
+    var m, k = 0;
+    while ((m = re.exec(t)) !== null && k < n) {
+      k++;
+      lines.push(label + k + ': ' + t.slice(Math.max(0, m.index - before), m.index + after).replace(/\s+/g, ' '));
+    }
+  }
+  ctx('fetch', /fetch\(/g, 2, 30, 170);
+  ctx('open', /\.open\(/g, 2, 30, 170);
+  ctx('ajax', /(?:\$\.(?:post|get|ajax)|axios)/g, 2, 20, 170);
+  ctx('file', /file\s*[:=]/g, 2, 40, 150);
+  (t.match(/<script[^>]+src=["'][^"']+["']/g) || []).slice(0, 3).forEach(function (x) { lines.push('js: ' + x.slice(0, 190)); });
+  return lines.slice(0, 11).map(function (l) { return debugStream(l)[0]; });
 }
 
 // Aynı adresi farklı oynatıcı ayarlarıyla sunar; hangisi çalışırsa o kullanılır
@@ -314,7 +372,12 @@ async function run(tmdbId, mediaType) {
       if (!first) first = r;
       streams = streams.concat(makeVariants(r, players.length > 1 ? ' ' + (k + 1) : ''));
     }
-    if (!streams.length) return debugStream(errors.join(' | '));
+    if (!streams.length) {
+      var withEmbed = null;
+      for (var q = 0; q < resolved.length; q++) { if (resolved[q] && resolved[q].embed) { withEmbed = resolved[q]; break; } }
+      if (withEmbed) return debugStream(errors[0]).concat(discoverEmbed(withEmbed.player, withEmbed.embed));
+      return debugStream(errors.join(' | '));
+    }
 
     if (DEBUG && first) {
       STEP = 'probe';
