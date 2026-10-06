@@ -42,7 +42,7 @@ async function req(url, opts) {
     var res = await withTimeout(fetch(url, opts), 6000);
     var text = '';
     try { text = await withTimeout(res.text(), 6000); } catch (e) {}
-    return { status: res.status, text: text || '' };
+    return { status: res.status, text: text || '', url: res.url || '' };
   } catch (e) {
     return { status: 0, text: '', err: String(e && e.message ? e.message : e) };
   }
@@ -124,6 +124,25 @@ async function probe(url) {
   return 'm3u h:' + d(a) + ' n:' + d(b) + ' v' + v + ' s' + seg;
 }
 
+// Link bulunamazsa: sayfadaki ipuçlarını kısa satırlar halinde listeye yazar
+function discoverStreams(html, notes, slug) {
+  var t = String(html || '').replace(/\\\//g, '/');
+  var lines = ['sayfa ' + slug + ': m3u yok, vidmixi:' + (/vidmixi/i.test(t) ? 'var' : 'yok')];
+  notes.forEach(function (n) { lines.push(n); });
+  var i = t.indexOf('var partgrupid');
+  if (i > -1) {
+    var chunk = t.slice(i, i + 600).replace(/\s+/g, ' ');
+    for (var k = 0; k < 4 && k * 75 < chunk.length; k++) {
+      lines.push('js' + k + ': ' + chunk.slice(k * 75, (k + 1) * 75));
+    }
+  } else {
+    lines.push('pgsec kodu bulunamadı');
+  }
+  var calls = t.match(/(?:fetch|\$post|\$get|\$\.ajax|XMLHttpRequest|atob)\s*\([^)]{0,60}/g) || [];
+  calls.slice(0, 3).forEach(function (c) { lines.push('çağrı: ' + c.replace(/\s+/g, ' ')); });
+  return lines.slice(0, 10).map(function (l) { return debugStream(l)[0]; });
+}
+
 async function run(tmdbId, mediaType) {
   try {
     STEP = 'tmdb';
@@ -169,11 +188,28 @@ async function run(tmdbId, mediaType) {
     // m3u bağlantıları
     STEP = 'm3u';
     var links = extractM3u(html);
+    var notes = [];
     if (!links.length) {
-      return debugStream('sayfa ' + pageSlug + ' bulundu, m3u yok, iframe:' +
-        (html.match(/<iframe/gi) || []).length + ', vidmixi:' + (/vidmixi/i.test(html) ? 'var' : 'yok') +
-        ', ' + html.length + ' bayt');
+      // Sayfada hazır link yoksa: ylink.to kısa linklerini izle
+      STEP = 'ylink';
+      var plain = html.replace(/\\\//g, '/').replace(/&amp;/g, '&');
+      var yl = [];
+      (plain.match(/https?:\/\/ylink\.to\/[A-Za-z0-9_\-]+/g) || []).forEach(function (u) {
+        if (yl.indexOf(u) === -1) yl.push(u);
+      });
+      yl = yl.slice(0, 4);
+      var yres = await Promise.all(yl.map(function (u) {
+        return req(u, { headers: { 'User-Agent': ANDROID_UA, 'Referer': PRIMARY_DOMAIN + '/' } });
+      }));
+      yres.forEach(function (r, i2) {
+        var found = extractM3u((r.url || '') + ' ' + r.text);
+        found.forEach(function (u) { if (links.indexOf(u) === -1) links.push(u); });
+        notes.push('ylink ' + yl[i2].replace('https://', '') + ' -> ' + r.status + ' ' +
+                   (r.url || '').replace(/^https?:\/\//, '').slice(0, 40) + (found.length ? ' M3U!' : ''));
+      });
+      if (!yl.length) notes.push('ylink.to linki yok');
     }
+    if (!links.length) return discoverStreams(html, notes, pageSlug);
 
     var streams = [];
     links.forEach(function (u, k) {
