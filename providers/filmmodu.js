@@ -1,447 +1,722 @@
 // ============================================================
-//  Filmmodu — Nuvio Provider
-//  Site adresi değişirse sadece PRIMARY_DOMAIN satırını güncelle.
-//  DEBUG = true iken sorun olursa listede "Filmmodu ⚠ ..." satırı çıkar.
+//  FilmModu — Nuvio Provider (tek dosya, bağımsız)
+//  Kaynak: filmmodu.one  |  Yedek: filmmodu.live (Pilavyer oynatıcı)
+//  Sadece film (movie) destekler.
+//
+//  Site adresi değişirse sadece aşağıdaki BASE_URL / LIVE_URL /
+//  PLAYER_HOST satırlarını güncelle.
 // ============================================================
 
-var PRIMARY_DOMAIN = 'https://filmmodu.cc';
-var TMDB_KEY = '000316508321ce461cf81e7c6815eec7';
-var DEBUG = true;
-var STEP = '';
-var ANDROID_UA = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Mobile Safari/537.36';
+var BASE_URL = 'https://www.filmmodu.one';
+var LIVE_URL = 'https://filmmodu.live';
+var PLAYER_HOST = 'https://play2.pilavyerplay.top';
+var TMDB_API_KEY = '000316508321ce461cf81e7c6815eec7';
 
-var PAGE_HEADERS = {
-  'User-Agent': ANDROID_UA,
+var HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language': 'tr-TR,tr;q=0.9',
-  'Referer': PRIMARY_DOMAIN + '/'
+  'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
+  'Referer': BASE_URL + '/'
 };
 
-function withTimeout(promise, ms) {
-  return new Promise(function (resolve, reject) {
-    var t = setTimeout(function () { reject(new Error('timeout')); }, ms);
-    promise.then(function (v) { clearTimeout(t); resolve(v); },
-                 function (e) { clearTimeout(t); reject(e); });
+// ── Kaliteye göre sıralama (1080p önce) ──────────────────────
+function getQualityScore(s) {
+  if (!s) return 0;
+  if (!s.url) return 1;
+  var q = ((s.quality || "") + " " + (s.title || "") + " " + (s.name || "")).toLowerCase();
+  var score = 0;
+  if (/\b(4k|2160p?|uhd)\b/.test(q)) score = 2160;
+  else if (/\b(2k|1440p?|qhd)\b/.test(q)) score = 1440;
+  else if (/\b(1080p?|fhd)\b/.test(q)) score = 1080;
+  else if (/\b(720p?|hd)\b/.test(q)) score = 720;
+  else if (/\b(540p?)\b/.test(q)) score = 540;
+  else if (/\b(480p?|sd)\b/.test(q)) score = 480;
+  else if (/\b(360p?)\b/.test(q)) score = 360;
+  else if (/\b(240p?)\b/.test(q)) score = 240;
+  if (score === 0 && s.title) {
+    var text = s.title.toLowerCase();
+    if (/\b(4k|2160p|uhd)\b/.test(text)) score = 2160;
+    else if (/\b(2k|1440p|qhd)\b/.test(text)) score = 1440;
+    else if (/\b(1080p|fhd)\b/.test(text)) score = 1080;
+    else if (/\b(720p|hd)\b/.test(text)) score = 720;
+    else if (/\b(480p|sd)\b/.test(text)) score = 480;
+    else if (/\b(360p)\b/.test(text)) score = 360;
+    else if (/\b(240p)\b/.test(text)) score = 240;
+  }
+  if (score === 0 && s.url) {
+    var u = s.url.toLowerCase();
+    if (/[\/_.-](2160p?|4k)[\/_.-]/.test(u)) score = 2160;
+    else if (/[\/_.-](1440p?|2k)[\/_.-]/.test(u)) score = 1440;
+    else if (/[\/_.-](1080p?|fhd)[\/_.-]/.test(u)) score = 1080;
+    else if (/[\/_.-](720p?|hd)[\/_.-]/.test(u)) score = 720;
+    else if (/[\/_.-](480p?|sd)[\/_.-]/.test(u)) score = 480;
+    else if (/[\/_.-](360p?)[\/_.-]/.test(u)) score = 360;
+  }
+  var isDirectMp4 = s.format === "mp4" || s.type === "mp4" || !s.isHls && s.url && (s.url.endsWith(".mp4") || s.url.includes(".mp4?"));
+  if (isDirectMp4 && score > 0) score += 1;
+  return score;
+}
+function sortStreamsByQuality(streams) {
+  if (!Array.isArray(streams) || streams.length === 0) return streams;
+  return streams.slice().sort(function(a, b) {
+    return getQualityScore(b) - getQualityScore(a);
   });
 }
 
-function slugify(s) {
-  var map = { 'ç': 'c', 'ğ': 'g', 'ı': 'i', 'ö': 'o', 'ş': 's', 'ü': 'u', 'â': 'a', 'î': 'i', 'û': 'u' };
-  return String(s || '').replace(/İ/g, 'i').toLowerCase()
-    .replace(/[çğıöşüâîû]/g, function (c) { return map[c]; })
-    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-}
 
-function norm(s) {
-  return slugify(s).replace(/-/g, '');
-}
+// ── Güvenli Cheerio Yükleyici (QuickJS uyumlu) ────────────────
+var cheerio = (function() {
+  try { if (typeof require !== 'undefined') return require('cheerio-without-node-native'); } catch (e) {}
+  try { if (typeof require !== 'undefined') return require('cheerio'); } catch (e2) {}
+  return null;
+})();
 
-// Durum kodu + metin döndürür (hata olsa da)
-async function req(url, opts) {
-  try {
-    var res = await withTimeout(fetch(url, opts), 6000);
-    var text = '';
-    try { text = await withTimeout(res.text(), 6000); } catch (e) {}
-    return { status: res.status, text: text || '', url: res.url || '' };
-  } catch (e) {
-    return { status: 0, text: '', err: String(e && e.message ? e.message : e) };
+// ── Yardımcı: Zaman aşımı sinyali (QuickJS uyumlu) ───────────
+function timeoutSignal(ms) {
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+    try { return AbortSignal.timeout(ms); } catch (e) {}
   }
-}
-
-function debugStream(msg) {
-  console.log('[Filmmodu] ' + msg);
-  if (!DEBUG) return [];
-  return [{
-    name: 'Filmmodu ⚠ ' + msg.slice(0, 210),
-    title: '⚠ ' + msg,
-    url: 'https://example.com/debug.m3u8',
-    quality: 'Auto',
-    type: 'hls',
-    headers: {}
-  }];
-}
-
-// ---------- Base64 (atob her ortamda olmayabilir) ----------
-var B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-function decodeB64(s) {
-  s = String(s || '').replace(/[^A-Za-z0-9+\/]/g, '');
-  var out = '', bits = 0, acc = 0;
-  for (var i = 0; i < s.length; i++) {
-    acc = (acc << 6) | B64.indexOf(s.charAt(i));
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out += String.fromCharCode((acc >> bits) & 255);
-      acc &= (1 << bits) - 1;
-    }
+  if (typeof AbortController !== 'undefined') {
+    var c = new AbortController();
+    setTimeout(function() { try { c.abort(); } catch (e) {} }, ms);
+    return c.signal;
   }
-  return out;
+  return null;
 }
 
-function reverseStr(s) {
-  var o = '';
-  for (var i = s.length - 1; i >= 0; i--) o += s.charAt(i);
-  return o;
-}
+// ── Yardımcı: TMDB'den film bilgisi çek ─────────────────────
+async function fetchTmdbInfo(tmdbId) {
+  let cleanId = String(tmdbId || '').trim();
+  if (cleanId.includes(':')) cleanId = cleanId.split(':')[0];
 
-// ---------- Film sayfası ----------
-function pageTitle(html) {
-  return ((html.match(/<title>([^<]*)<\/title>/i) || [])[1] || '').replace(/\s+/g, ' ').trim();
-}
-
-// Doğru film mi? Başlıkta ad (Türkçe veya orijinal) ve yıl (±1) aranır
-function isRightMovie(html, title, origTitle, year) {
-  var t = pageTitle(html);
-  var nt = norm(t);
-  var y = parseInt(year, 10), yearOk = false;
-  for (var d = -1; d <= 1; d++) {
-    if (!isNaN(y) && t.indexOf(String(y + d)) > -1) yearOk = true;
-  }
-  var nameOk = (title && nt.indexOf(norm(title)) > -1) || (origTitle && nt.indexOf(norm(origTitle)) > -1);
-  return yearOk && nameOk;
-}
-
-// Film sayfasını bulur: önce adres tahmini, olmazsa sitenin kendi araması (POST /arama/)
-async function findFilmPage(title, origTitle, year) {
-  var tr = slugify(title), en = slugify(origTitle);
-  var tried = [], seenTitle = '', codes = [];
-
-  async function tryPaths(slugs) {
-    slugs = slugs.filter(function (x, i) { return x && slugs.indexOf(x) === i && tried.indexOf(x) === -1; });
-    slugs.forEach(function (x) { tried.push(x); });
-    var pages = await Promise.all(slugs.map(function (x) {
-      return req(PRIMARY_DOMAIN + '/film/' + x + '/', { headers: PAGE_HEADERS });
-    }));
-    for (var i = 0; i < pages.length; i++) {
-      codes.push(pages[i].status);
-      if (pages[i].status !== 200 || !pages[i].text) continue;
-      if (!seenTitle) seenTitle = pageTitle(pages[i].text);
-      if (isRightMovie(pages[i].text, title, origTitle, year)) return { html: pages[i].text, slug: slugs[i] };
-    }
-    return null;
-  }
-
-  // 1) Adres tahmini: bazı filmlerde sonunda -izle var
-  var guesses = [tr, tr + '-izle', en, en + '-izle'];
-  if (tr && en && tr !== en) { guesses.push(tr + '-' + en + '-izle'); guesses.push(tr + '-' + en); }
-  if (en && year) { guesses.push(en + '-izle-' + year); guesses.push(en + '-' + year); }
-  if (tr && year) { guesses.push(tr + '-' + year); guesses.push(tr + '-izle-' + year); }
-  var hit = await tryPaths(guesses.slice(0, 9));
-  if (hit) return hit;
-
-  // 2) Sitenin araması: POST /arama/  action=ajax_search&arama_kelime=...
-  STEP = 'arama';
-  var qs = [];
-  [title, origTitle].forEach(function (q) { if (q && qs.indexOf(q) === -1) qs.push(q); });
-  var sres = await Promise.all(qs.map(function (q) {
-    return req(PRIMARY_DOMAIN + '/arama/', {
-      method: 'POST',
-      headers: {
-        'User-Agent': ANDROID_UA,
-        'Accept': '*/*',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Origin': PRIMARY_DOMAIN,
-        'Referer': PRIMARY_DOMAIN + '/'
-      },
-      body: 'action=ajax_search&arama_kelime=' + encodeURIComponent(q)
-    });
-  }));
-  var slugs = [];
-  sres.forEach(function (r) {
-    var txt = r.text.replace(/\\\//g, '/');
-    var re = /\/film\/([a-z0-9\-]+)\/?/g, m;
-    while ((m = re.exec(txt)) !== null) { if (slugs.indexOf(m[1]) === -1) slugs.push(m[1]); }
-  });
-  hit = await tryPaths(slugs.slice(0, 8));
-  if (hit) return hit;
-
-  return { html: '', note: 'film sayfası yok (' + tr + ' ' + codes.slice(0, 3).join('/') + '), arama: ' +
-    sres.map(function (r) { return r.status + '/' + slugs.length; }).join(' ') +
-    (seenTitle ? ', başlık tutmadı: ' + seenTitle : '') };
-}
-
-// ---------- Oynatıcı bulma ----------
-// Sayfada iki yerde olabilir:
-//  1) düz yazı:  <iframe src="https://vidmixi.com/embed/32HANELİKİMLİK">
-//  2) pdata['prt_atom0'] = '...base64...'  (sayfa betiği çözüp iframe'e çeviriyor)
-function extractEmbeds(html) {
-  var text = String(html || '').replace(/\\\//g, '/').replace(/&amp;/g, '&');
-  var out = [], seen = {};
-  function add(host, id) {
-    if (seen[id]) return;
-    seen[id] = true;
-    out.push({ host: host, id: id });
-  }
-  var re = /https?:\/\/([a-z0-9.\-]+)\/(?:embed|video)\/([a-f0-9]{32})/gi, m;
-  while ((m = re.exec(text)) !== null) add(m[1], m[2]);
-
-  var pre = reverseStr('BSZtFmcmlGP'); // sayfadaki betikteki ön ek: PGlmcmFtZSB ("<iframe ")
-  var pr = /pdata\[\s*['"]([^'"]+)['"]\s*\]\s*=\s*['"]([^'"]+)['"]/g, pm;
-  while ((pm = pr.exec(text)) !== null) {
-    var data = pm[2];
-    if (data.substring(0, 30) !== 'PGltZyB3aWR0aD0iMTAwJSIgaGVpZ2') data = pre + data;
-    var dec = decodeB64(data);
-    var em = dec.match(/https?:\/\/([a-z0-9.\-]+)\/(?:embed|video)\/([a-f0-9]{32})/i);
-    if (em) add(em[1], em[2]);
-  }
-  return out;
-}
-
-// p.a.c.k.e.r ile sıkıştırılmış JS'i açar
-function unpackPacked(src) {
-  var m = String(src || '').match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\)/);
-  if (!m) return '';
-  var p = m[1].replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-  var a = parseInt(m[2], 10), c = parseInt(m[3], 10), k = m[4].split('|');
-  function enc(n) {
-    return (n < a ? '' : enc(Math.floor(n / a))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
-  }
-  var d = {};
-  while (c--) d[enc(c)] = k[c] || enc(c);
-  return p.replace(/\b\w+\b/g, function (w) { return d[w] !== undefined ? d[w] : w; });
-}
-
-// Metin içinde yayın adresi arar: /m3u/KOD, .m3u8, master.txt, /api/stream.php?v=...&token=...
-// ve son çare olarak "file"/"src" alanlarındaki ilk medya adresi
-function findStreamInText(text) {
-  text = String(text || '').replace(/\\u0026/gi, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&');
-  var m = text.match(/https?:\/\/[^"'\s\\<>]+?\/api\/stream\.php\?[^"'\s\\<>]+/);
-  if (m) return m[0];
-  m = text.match(/https?:\/\/[^"'\s\\<>]+?(?:\/m3u\/[A-Za-z0-9+\/=_\-]{20,}|\.m3u8[^"'\s\\<>]*|master\.txt[^"'\s\\<>]*)/);
-  if (m) return m[0];
-  var re = /["']?(?:file|src|source|hls|stream)["']?\s*[:=]\s*["'](https?:\/\/[^"'\s\\<>]+)["']/gi, g;
-  while ((g = re.exec(text)) !== null) {
-    if (/\.(js|css|png|jpe?g|gif|webp|svg|ico|woff2?|vtt|srt)(\?|$)/i.test(g[1])) continue;
-    if (/jquery|jwplatform|jsdelivr|cdnbye|googleapis|gstatic|google/i.test(g[1])) continue;
-    return g[1];
-  }
-  return '';
-}
-
-// Yayın adresindeki token'dan (JSON) izin verilen kaynak sitesini ("o") okur
-function tokenOrigin(url) {
-  var m = String(url || '').match(/[?&]token=([A-Za-z0-9_\-]+)\./);
-  if (!m) return '';
-  try {
-    var j = JSON.parse(decodeB64(m[1].replace(/-/g, '+').replace(/_/g, '/')));
-    return j && j.o ? String(j.o) : '';
-  } catch (e) { return ''; }
-}
-
-// Oynatıcıdan taze (süreli) yayın adresini alır:
-//  1) gömme sayfasını (/embed/KİMLİK) açıp içinden arar
-//  2) olmazsa /player/index.php?data=KİMLİK&do=getVideo servisini dener
-async function resolvePlayer(player, pageUrl) {
-  var base = 'https://' + player.host;
-  var e = await req(base + '/embed/' + player.id, {
-    headers: {
-      'User-Agent': ANDROID_UA,
-      'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
-      'Accept-Language': 'tr-TR,tr;q=0.9',
-      'Referer': PRIMARY_DOMAIN + '/'
-    }
-  });
-  var plain = e.text.replace(/\\\//g, '/').replace(/&amp;/g, '&');
-  var url = findStreamInText(plain);
-  if (!url) {
-    var unp = unpackPacked(plain);
-    if (unp) url = findStreamInText(unp);
-  }
-
-  var gv = null;
-  if (!url) {
-    gv = await req(base + '/player/index.php?data=' + player.id + '&do=getVideo', {
-      method: 'POST',
-      headers: {
-        'User-Agent': ANDROID_UA,
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'X-Requested-With': 'XMLHttpRequest',
-        'Origin': base,
-        'Referer': base + '/embed/' + player.id
-      },
-      body: 'hash=' + player.id + '&r=' + encodeURIComponent(pageUrl)
-    });
+  let numericId = cleanId;
+  if (cleanId.startsWith('tt')) {
     try {
-      var j = JSON.parse(gv.text);
-      url = j.securedLink || j.videoSource || '';
-    } catch (er) {}
-    if (!url) url = findStreamInText(gv.text.replace(/\\\//g, '/'));
+      const fRes = await fetch(`https://api.themoviedb.org/3/find/${cleanId}?api_key=${TMDB_API_KEY}&external_source=imdb_id`);
+      if (fRes.ok) {
+        const fData = await fRes.json();
+        if (fData.movie_results && fData.movie_results.length > 0) {
+          numericId = fData.movie_results[0].id;
+        }
+      }
+    } catch (e) {}
   }
-  if (!url) {
-    return { error: 'embed HTTP ' + e.status + ', getVideo HTTP ' + (gv ? gv.status : '-'), embed: e, player: player };
-  }
-  url = url.replace(/\\\//g, '/');
-  if (url.indexOf('http') !== 0) url = base + (url.charAt(0) === '/' ? '' : '/') + url;
 
+  var url = 'https://api.themoviedb.org/3/movie/' + numericId
+    + '?api_key=' + TMDB_API_KEY
+    + '&language=tr-TR';
+
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('TMDB yanıt vermedi: ' + r.status);
+  const data = await r.json();
   return {
-    url: url,
-    origin: tokenOrigin(url),
-    headers: { 'User-Agent': ANDROID_UA, 'Referer': base + '/', 'Origin': base }
+    titleTr:  data.title || '',
+    titleEn:  data.original_title || '',
+    year:     data.release_date ? data.release_date.slice(0, 4) : ''
   };
 }
 
-// Gömme sayfasında link bulunamazsa: sayfanın video yükleme kodunu kısa satırlarla gösterir
-function discoverEmbed(player, e) {
-  var raw = String(e.text || '').replace(/\\\//g, '/');
-  var t = raw, unp = unpackPacked(raw);
-  if (unp) t += '\n' + unp;
-  function count(re) { return (t.match(re) || []).length; }
-  var lines = ['embed ' + player.host + ' HTTP ' + e.status + ', ' + raw.length + ' bayt, m3u:' + count(/\/m3u\//g) +
-    ' m3u8:' + count(/m3u8/g) + ' file:' + count(/file\s*[:=]/g) + ' fetch:' + count(/fetch\(/g) +
-    ' open:' + count(/\.open\(/g) + ' eval:' + count(/eval\(/g) + ' atob:' + count(/atob\(/g) +
-    ' stream.php:' + count(/stream\.php/g) + ' pilav:' + count(/pilavyer/g) + (unp ? ' paketli' : '')];
-  if (raw.length < 700) lines.push('ham: ' + raw.replace(/\s+/g, ' ').slice(0, 200));
-  function ctx(label, re, n, before, after) {
-    var m, k = 0;
-    while ((m = re.exec(t)) !== null && k < n) {
-      k++;
-      lines.push(label + k + ': ' + t.slice(Math.max(0, m.index - before), m.index + after).replace(/\s+/g, ' '));
-    }
-  }
-  ctx('fetch', /fetch\(/g, 2, 30, 170);
-  ctx('open', /\.open\(/g, 2, 30, 170);
-  ctx('ajax', /(?:\$\.(?:post|get|ajax)|axios)/g, 2, 20, 170);
-  ctx('file', /file\s*[:=]/g, 2, 40, 150);
-  var inl = t.match(/<script(?![^>]*\ssrc=)[^>]*>[\s\S]*?<\/script>/gi) || [];
-  inl.slice(0, 3).forEach(function (x, i) { lines.push('script' + (i + 1) + ': ' + x.replace(/\s+/g, ' ').slice(0, 200)); });
-  return lines.slice(0, 11).map(function (l) { return debugStream(l)[0]; });
+// ── Yardımcı: Başlık temizleme (noktalama ve özel karakterler)
+function cleanTitle(str) {
+  if (!str) return '';
+  return str
+    .replace(/[:"'\-_/\\,.]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-// Aynı adresi farklı oynatıcı ayarlarıyla sunar; hangisi çalışırsa o kullanılır
-function makeVariants(r, tag) {
-  var h = r.headers || {};
-  var slim = { 'User-Agent': h['User-Agent'], 'Referer': h['Referer'] };
-  var tagged = r.url + (r.url.indexOf('?') > -1 ? '&' : '?') + 'ext=.m3u8';
-  function mk(suffix, type, headers, u) {
-    return {
-      name: 'Filmmodu' + tag + suffix,
-      title: '⌜ FILMMODU ⌟ | HLS' + suffix,
-      url: u || r.url,
-      quality: 'Auto',
-      type: type,
-      headers: headers
-    };
-  }
-  var list = [
-    mk('', 'hls', h),
-    mk(' (başlıksız)', 'hls', {}),
-    mk(' (m3u8)', 'm3u8', slim),
-    mk(' (.m3u8 ek)', 'hls', slim, tagged)
-  ];
-  if (r.origin) {
-    var oh = { 'User-Agent': ANDROID_UA, 'Referer': 'https://' + r.origin + '/', 'Origin': 'https://' + r.origin };
-    list.splice(1, 0, mk(' (' + r.origin + ')', 'hls', oh));
-  }
-  return list;
+// ── Yardımcı: Başlığı URL karşılaştırması için normalize et ─
+function normalizeForUrl(str) {
+  if (!str) return '';
+  return str
+    .toLowerCase()
+    .replace(/ğ/g, 'g').replace(/ü/g, 'u').replace(/ş/g, 's')
+    .replace(/ı/g, 'i').replace(/ö/g, 'o').replace(/ç/g, 'c')
+    .replace(/â|á|à/g, 'a').replace(/î|í/g, 'i').replace(/û|ú/g, 'u')
+    .replace(/[^a-z0-9]/g, '');
 }
 
-// Listeyi başlıklı ve başlıksız çekip durum/içerik özeti çıkarır
-async function probe(r) {
-  var a = await req(r.url, { headers: r.headers });
-  var b = await req(r.url, { headers: { 'User-Agent': ANDROID_UA } });
-  function d(x) { return x.status + (x.text.indexOf('#EXTM3U') === 0 ? ' ok' : ' ?'); }
-  var t = a.text.indexOf('#EXTM3U') === 0 ? a.text : (b.text || '');
-  var v = (t.match(/#EXT-X-STREAM-INF/g) || []).length;
-  var seg = (t.match(/#EXTINF/g) || []).length;
-  var au = /#EXT-X-MEDIA:[^\n]*TYPE=AUDIO/.test(t) ? 1 : 0;
-  return 'liste h:' + d(a) + ' n:' + d(b) + ' v' + v + ' s' + seg + ' a' + au;
-}
-
-// Oynatıcı bulunamazsa: videoyu sayfaya koyan kodun nerede olduğunu kısa satırlarla gösterir
-function discoverStreams(html, slug) {
-  var t = String(html || '').replace(/\\\//g, '/');
-  function count(re) { return (t.match(re) || []).length; }
-  var lines = ['sayfa ' + slug + ': oynatıcı yok, ' + t.length + ' bayt, vidmixi:' + count(/vidmixi/gi) +
-    ' pdata:' + count(/pdata\[/g) + ' vidon:' + count(/New_videoplayer_vidon/g) +
-    ' f_player:' + count(/f_player/g) + ' atob:' + count(/atob\(/g)];
-  function ctx(label, re, n, before, after) {
-    var m, k = 0;
-    while ((m = re.exec(t)) !== null && k < n) {
-      k++;
-      lines.push(label + k + ': ' + t.slice(Math.max(0, m.index - before), m.index + after).replace(/\s+/g, ' '));
-    }
-  }
-  ctx('pd', /pdata\[/g, 2, 20, 170);
-  ctx('fp', /f_player/g, 2, 60, 140);
-  ctx('src', /\.src\s*=/g, 2, 70, 130);
-  return lines.slice(0, 9).map(function (l) { return debugStream(l)[0]; });
-}
-
-async function run(tmdbId, mediaType) {
+// ── Yardımcı: Sonuçlar arasından en iyi eşleşmeyi bul ───────
+function slugFromHref(href) {
   try {
-    STEP = 'tmdb';
-    if (mediaType !== 'movie') return []; // site sadece film içeriyor
-
-    var t = await req('https://api.themoviedb.org/3/movie/' + tmdbId +
-                      '?language=tr-TR&api_key=' + TMDB_KEY);
-    var info = {};
-    try { info = JSON.parse(t.text); } catch (e) {}
-    var title = info.title, origTitle = info.original_title;
-    var year = (info.release_date || '').slice(0, 4);
-    if (!title && !origTitle) return debugStream('TMDB boş, HTTP ' + t.status + (t.err ? ' ' + t.err : ''));
-
-    STEP = 'sayfa';
-    var found = await findFilmPage(title, origTitle, year);
-    if (!found.html) return debugStream(found.note);
-    var html = found.html, pageSlug = found.slug;
-    var pageUrl = PRIMARY_DOMAIN + '/film/' + pageSlug + '/';
-
-    STEP = 'oynatici';
-    var players = extractEmbeds(html);
-    if (!players.length) return discoverStreams(html, pageSlug);
-
-    STEP = 'getVideo';
-    var resolved = await Promise.all(players.map(function (p) { return resolvePlayer(p, pageUrl); }));
-    var streams = [], errors = [], first = null;
-    for (var k = 0; k < players.length; k++) {
-      var r = resolved[k];
-      if (!r || r.error) { errors.push(r ? r.error : 'boş'); continue; }
-      if (!first) first = r;
-      streams = streams.concat(makeVariants(r, players.length > 1 ? ' ' + (k + 1) : ''));
-    }
-    if (!streams.length) {
-      var withEmbed = null;
-      for (var q = 0; q < resolved.length; q++) { if (resolved[q] && resolved[q].embed) { withEmbed = resolved[q]; break; } }
-      if (withEmbed) return debugStream(errors[0]).concat(discoverEmbed(withEmbed.player, withEmbed.embed));
-      return debugStream(errors.join(' | '));
-    }
-
-    if (DEBUG && first) {
-      STEP = 'probe';
-      var info2 = await Promise.race([
-        probe(first),
-        new Promise(function (res) { setTimeout(function () { res('probe süresi doldu'); }, 4000); })
-      ]);
-      streams.push({
-        name: 'Filmmodu ⚠ ' + info2,
-        title: '⚠ ' + info2,
-        url: first.url,
-        quality: 'Auto',
-        type: 'hls',
-        headers: first.headers
-      });
-    }
-    return streams;
-  } catch (err) {
-    return debugStream('hata: ' + err);
-  }
+    var last = href.split('/').filter(Boolean).pop() || '';
+    return last.replace(/-film-izle.*$/i, '').replace(/-izle.*$/i, '').trim();
+  } catch (e) { return href; }
 }
 
-// Toplam süre sınırı: takılırsa hangi adımda kaldığını yazar
-async function getStreams(tmdbId, mediaType, season, episode) {
-  var timer;
-  var timeout = new Promise(function (resolve) {
-    timer = setTimeout(function () { resolve(debugStream('zaman aşımı, adım: ' + STEP)); }, 12000);
-  });
-  var out = await Promise.race([run(tmdbId, mediaType), timeout]);
-  clearTimeout(timer);
-  return out;
+function findBestMatch(results, searchTitle, year) {
+  var normalizedSearch = normalizeForUrl(searchTitle);
+  var slugSearch = normalizeForUrl(slugFromHref(searchTitle));
+
+  // 0. Slug tam eşleşme (en güvenilir) — ör. "the-matrix" vs "the-matrix-reloaded"
+  for (var s = 0; s < results.length; s++) {
+    var slugNorm = normalizeForUrl(slugFromHref(results[s].href));
+    if (slugNorm === normalizedSearch || slugNorm === slugSearch) {
+      console.log('[FilmModu] Slug tam eşleşti: ' + results[s].href);
+      return results[s].href;
+    }
+  }
+  // 1. Hem başlık hem yıl URL'de eşleşiyor mu?
+  if (year) {
+    for (var i = 0; i < results.length; i++) {
+      var normalizedHref = normalizeForUrl(results[i].href);
+      if (normalizedHref.indexOf(normalizedSearch) !== -1 && results[i].href.indexOf(year) !== -1) {
+        console.log('[FilmModu] Başlık+yıl eşleşti: ' + results[i].href);
+        return results[i].href;
+      }
+    }
+  }
+
+  // 2. Sadece başlık URL'de eşleşiyor mu? (slug içinde, en kısa eşleşmeyi tercih et)
+  var best = null;
+  var bestLen = Infinity;
+  for (var j = 0; j < results.length; j++) {
+    var normalizedHref2 = normalizeForUrl(results[j].href);
+    if (normalizedHref2.indexOf(normalizedSearch) !== -1) {
+      var len = normalizedHref2.length;
+      if (len < bestLen) { best = results[j].href; bestLen = len; }
+    }
+  }
+  if (best) {
+    console.log('[FilmModu] Başlık eşleşti (en kısa): ' + best);
+    return best;
+  }
+
+  // 3. Sadece yıl URL'de eşleşiyor mu?
+  if (year) {
+    for (var k = 0; k < results.length; k++) {
+      if (results[k].href.indexOf(year) !== -1) {
+        console.log('[FilmModu] Yıl eşleşti: ' + results[k].href);
+        return results[k].href;
+      }
+    }
+  }
+
+  console.log('[FilmModu] Güvenilir eşleşme bulunamadı, atlanıyor');
+  return null;
+}
+
+// ── Yardımcı: FilmModu.one'da arama yap (301/404 dayanıklı) ──
+function searchFilmModu(rawTitle, year) {
+  var title = cleanTitle(rawTitle);
+  if (!title) return Promise.resolve(null);
+
+  var searchUrl = BASE_URL + '/film-ara?term=' + encodeURIComponent(title);
+  console.log('[FilmModu] Aranıyor: ' + searchUrl);
+
+  return fetch(searchUrl, { headers: HEADERS, redirect: 'manual' })
+    .then(function(r) {
+      if (r.status === 301 || r.status === 302) {
+        var loc = r.headers.get('location');
+        if (loc && loc.indexOf('/film-ara') === -1) {
+          return fetch(loc, { headers: HEADERS })
+            .then(function(locRes) {
+              if (locRes.ok) return { redirectUrl: loc, html: null };
+              return { redirectUrl: null, html: null };
+            })
+            .catch(function() { return { redirectUrl: null, html: null }; });
+        }
+      }
+      if (!r.ok && r.status !== 301 && r.status !== 302) {
+        return { redirectUrl: null, html: null };
+      }
+      return r.text().then(function(html) { return { redirectUrl: null, html: html }; });
+    })
+    .then(function(result) {
+      if (!result) return null;
+      if (result.redirectUrl) return result.redirectUrl;
+      if (!result.html) return null;
+
+      
+      var $ = cheerio.load(result.html);
+
+      // Sayfa zaten bir film sayfası mı? (div.alternates varsa)
+      if ($('div.alternates').length > 0) {
+        var canonical = $('link[rel="canonical"]').attr('href') || '';
+        if (canonical) {
+          console.log('[FilmModu] Sayfa film sayfası, canonical: ' + canonical);
+          return canonical;
+        }
+        return searchUrl;
+      }
+
+      var results = [];
+      $('div.movie').each(function() {
+        var a    = $(this).find('a').first();
+        var href = a.attr('href') || '';
+        var text = a.text().trim();
+        if (href) results.push({ href: href, text: text });
+      });
+
+      console.log('[FilmModu] Bulunan sonuç sayısı: ' + results.length);
+      if (results.length === 0) return null;
+
+      return findBestMatch(results, title, year);
+    })
+    .catch(function(err) {
+      console.log('[FilmModu] Arama hatası: ' + err.message);
+      return null;
+    });
+}
+
+// ── Yardımcı: Film sayfasından kaynak linklerini çek ────────
+function fetchAlternateLinks(filmUrl) {
+  console.log('[FilmModu] Film sayfası: ' + filmUrl);
+
+  return fetch(filmUrl, { headers: HEADERS })
+    .then(function(r) {
+      if (!r.ok) throw new Error('Film sayfası yüklenemedi: ' + r.status);
+      return r.text();
+    })
+    .then(function(html) {
+      
+      var $ = cheerio.load(html);
+      var links = [];
+
+      $('div.alternates a').each(function() {
+        var href = $(this).attr('href') || '';
+        var name = $(this).text().trim();
+        // Fragman linkini kesinlikle atla!
+        if (name && !name.toLowerCase().includes('fragman') && href) {
+          if (!links.some(function(l) { return l.href === href; })) {
+            links.push({ href: href, name: name });
+          }
+        }
+      });
+
+      // Alternates boşsa ana sayfayı ekle
+      if (links.length === 0) {
+        links.push({ href: filmUrl, name: 'Ana Kaynak' });
+      }
+
+      console.log('[FilmModu] Kaynak linki sayısı: ' + links.length);
+      return links;
+    });
+}
+
+// ── Yardımcı: M3U8 Segment Canlılık Doğrulayıcı ─────────────
+// Ölü/503 veren CDN düğümlerini (canvopics.life, ytconvertor.click vb.) tespit edip eler.
+function verifySegmentPlayable(m3u8Url, headers) {
+  var sig = timeoutSignal(3500);
+  var opts = { headers: headers };
+  if (sig) opts.signal = sig;
+
+  return fetch(m3u8Url, opts)
+    .then(function(res) {
+      if (!res.ok) return false;
+      return res.text().then(function(text) {
+        var lines = text.split('\n');
+        var firstSeg = null;
+        for (var i = 0; i < lines.length; i++) {
+          var line = lines[i].trim();
+          if (line && line.indexOf('#') !== 0 && line.indexOf('http') === 0) {
+            firstSeg = line;
+            break;
+          }
+        }
+        if (!firstSeg) return false;
+
+        var segSig = timeoutSignal(3500);
+        var segHdrs = Object.assign({}, headers, { 'Range': 'bytes=0-1024' });
+        var segOpts = { method: 'GET', headers: segHdrs };
+        if (segSig) segOpts.signal = segSig;
+
+        return fetch(firstSeg, segOpts)
+          .then(function(segRes) {
+            var ok = segRes.ok || segRes.status === 206;
+            if (!ok) {
+              console.log('[FilmModu] Segment oynatılamaz (HTTP ' + segRes.status + '): ' + firstSeg.slice(0, 60));
+            }
+            return ok;
+          })
+          .catch(function() {
+            return false;
+          });
+      });
+    })
+    .catch(function() {
+      return false;
+    });
+}
+
+// ── Yardımcı: Tek bir kaynak linkinden stream çek ───────────
+function fetchStreamsFromAlt(altLink, filmUrl) {
+  var altHeaders = Object.assign({}, HEADERS, { 'Referer': filmUrl });
+
+  return fetch(altLink.href, { headers: altHeaders })
+    .then(function(r) {
+      if (!r.ok) return [];
+      return r.text();
+    })
+    .then(function(altHtml) {
+      var videoIdMatch   = altHtml.match(/var videoId\s*=\s*'([^']+)'/);
+      var videoTypeMatch = altHtml.match(/var videoType\s*=\s*'([^']*)'/);
+
+      if (!videoIdMatch) {
+        console.log('[FilmModu] videoId bulunamadı: ' + altLink.href);
+        return [];
+      }
+
+      var videoId   = videoIdMatch[1];
+      var videoType = (videoTypeMatch && videoTypeMatch[1]) || '';
+      var sourceUrl = BASE_URL + '/get-source?movie_id=' + videoId + '&type=' + videoType;
+
+      console.log('[FilmModu] get-source isteği: ' + sourceUrl);
+
+      var sourceHeaders = Object.assign({}, HEADERS, {
+        'Referer':          altLink.href,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept':           'application/json, text/javascript, */*'
+      });
+
+      return fetch(sourceUrl, { headers: sourceHeaders })
+        .then(function(r) {
+          if (!r.ok) return [];
+          return r.json();
+        })
+        .then(function(data) {
+          if (!data || !data.sources || data.sources.length === 0) {
+            console.log('[FilmModu] Kaynak bulunamadı: ' + altLink.name);
+            return [];
+          }
+
+          var subtitleUrl = null;
+          if (data.subtitle) {
+            subtitleUrl = data.subtitle.startsWith('http')
+              ? data.subtitle
+              : BASE_URL + data.subtitle;
+          }
+
+          var fmHeaders = {
+            'Referer':    BASE_URL + '/',
+            'User-Agent': HEADERS['User-Agent']
+          };
+
+          // İlk kaynağı test ederek CDN depolama düğümünün canlı olduğunu doğrula (503 filtresi)
+          var probeSrc = data.sources[0].src;
+          if (probeSrc.indexOf('.m3u8') === -1) probeSrc = probeSrc + '.m3u8';
+
+          return verifySegmentPlayable(probeSrc, fmHeaders).then(function(isPlayable) {
+            if (!isPlayable) {
+              console.log('[FilmModu] ❌ Ölü CDN depolama filtresi: ' + altLink.name + ' akışları elendi.');
+              return [];
+            }
+
+            var streams = [];
+            data.sources.forEach(function(source) {
+              if (!source.src) return;
+              var qualityLabel = source.label || source.res ? (source.res + 'p') : 'HD';
+              var srcUrl = source.src;
+              if (srcUrl.indexOf('.m3u8') === -1) srcUrl = srcUrl + '.m3u8';
+
+              var streamObj = {
+                name:    'FilmModu',
+                title:   altLink.name + ' • ' + qualityLabel,
+                url:     srcUrl,
+                quality: qualityLabel,
+                type:    'hls',
+                format:  'hls',
+                isHls:   true,
+                headers: fmHeaders,
+                behaviorHints: {
+                  notWebReady: true,
+                  proxyHeaders: {
+                    request: fmHeaders
+                  }
+                }
+              };
+              if (subtitleUrl) {
+                streamObj.subtitles = [{
+                  url:      subtitleUrl,
+                  language: 'Türkçe',
+                  label:    'Türkçe',
+                  format:   'vtt',
+                  type:     'text/vtt'
+                }];
+              }
+              streams.push(streamObj);
+            });
+            return streams;
+          });
+        })
+        .catch(function(err) {
+          console.error('[FilmModu] get-source hatası (' + altLink.name + '): ' + err.message);
+          return [];
+        });
+    })
+    .catch(function(err) {
+      console.error('[FilmModu] Alt link hatası (' + altLink.href + '): ' + err.message);
+      return [];
+    });
+}
+
+// ── FilmModu Ağı Yedek Kaynağı (filmmodu.live / Pilavyer) ────
+function fetchStreamsFromLive(rawTitle, year) {
+  var q = cleanTitle(rawTitle);
+  if (!q) return Promise.resolve([]);
+
+  var searchUrl = LIVE_URL + '/ara?q=' + encodeURIComponent(q);
+  console.log('[FilmModu.live] Aranıyor: ' + searchUrl);
+
+  var liveHeaders = {
+    'User-Agent': HEADERS['User-Agent'],
+    'Referer':    LIVE_URL + '/'
+  };
+
+  var sig = timeoutSignal(5000);
+  var opts = { headers: liveHeaders };
+  if (sig) opts.signal = sig;
+
+  return fetch(searchUrl, opts)
+    .then(function(r) { return r.ok ? r.text() : ''; })
+    .then(function(html) {
+      if (!html) return [];
+      
+      var $ = cheerio.load(html);
+
+      var filmHref = null;
+      var normQ = normalizeForUrl(q);
+
+      // Sadece 'Filmler' bölümündeki sonuçları tara
+      var filmSection = null;
+      $('section').each(function() {
+        if ($(this).find('h2.section-title').text().indexOf('Filmler') !== -1) {
+          filmSection = $(this);
+        }
+      });
+
+      var container = filmSection || $('main');
+      var candidates = [];
+      container.find('a[href*="/film/"]').each(function() {
+        var href = $(this).attr('href') || '';
+        if (href.indexOf('https://') !== 0) href = LIVE_URL + href;
+        var candTitle = $(this).find('h3').text().trim() || $(this).find('img').attr('alt') || '';
+        var candYear = $(this).find('p').text().trim() || '';
+        if (!candidates.some(function(c) { return c.href === href; })) {
+          candidates.push({ href: href, title: candTitle, year: candYear });
+        }
+      });
+
+      var stopWords = ['the', 'a', 'an', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'bir', 've', 'ile', 'icin', 'de', 'da'];
+      var meaningfulWords = q.toLowerCase().split(/\s+/).filter(function(w) { return w.length > 2 && stopWords.indexOf(w) === -1; });
+      var words = meaningfulWords.length > 0 ? meaningfulWords : q.toLowerCase().split(/\s+/).filter(function(w) { return w.length > 2; });
+      var bestScore = -1;
+      for (var i = 0; i < candidates.length; i++) {
+        var cand = candidates[i];
+        var normH = normalizeForUrl(cand.href);
+        var normT = normalizeForUrl(cand.title);
+        var score = 0;
+
+        var fullMatch = normH.indexOf(normQ) !== -1 || normT.indexOf(normQ) !== -1;
+        if (fullMatch) {
+          score += 10;
+        }
+
+        var matchedWords = words.filter(function(w) {
+          var nw = normalizeForUrl(w);
+          return normH.indexOf(nw) !== -1 || normT.indexOf(nw) !== -1;
+        });
+
+        if (!fullMatch && matchedWords.length === 0) {
+          continue;
+        }
+
+        if (year && cand.year && cand.year === year) {
+          score += 8;
+        } else if (year && cand.href.indexOf(year) !== -1) {
+          score += 5;
+        }
+
+        score += matchedWords.length * 3;
+
+        if (score > bestScore && score >= 3) {
+          bestScore = score;
+          filmHref = cand.href;
+        }
+      }
+      if (!filmHref) return [];
+
+      console.log('[FilmModu.live] Film bulundu: ' + filmHref);
+      var sigPage = timeoutSignal(5000);
+      var pageOpts = { headers: liveHeaders };
+      if (sigPage) pageOpts.signal = sigPage;
+
+      return fetch(filmHref, pageOpts)
+        .then(function(pr) { return pr.ok ? pr.text() : ''; })
+        .then(function(pHtml) {
+          if (!pHtml) return [];
+          var pvMatch = pHtml.match(/data-pv="([^"]+)"/);
+          if (!pvMatch) return [];
+          var pv = pvMatch[1];
+          var playerEmbedUrl = PLAYER_HOST + '/assets/js/s.php?s=' + encodeURIComponent(pv);
+
+          var sigEmb = timeoutSignal(5000);
+          var embOpts = { headers: { 'Referer': LIVE_URL + '/', 'User-Agent': HEADERS['User-Agent'] } };
+          if (sigEmb) embOpts.signal = sigEmb;
+
+          return fetch(playerEmbedUrl, embOpts)
+            .then(function(er) { return er.ok ? er.text() : ''; })
+            .then(function(eHtml) {
+              if (!eHtml) return [];
+              var jsonMatch = eHtml.match(/window\.__PLAYER__\s*=\s*(\{[\s\S]*?\});<\/script>/) || eHtml.match(/window\.__PLAYER__\s*=\s*(\{.*?\});/);
+              if (!jsonMatch) return [];
+
+              var pData = null;
+              try { pData = JSON.parse(jsonMatch[1]); } catch (e) { return []; }
+              if (!pData || !pData.stream) return [];
+
+              var subtitles = [];
+              if (Array.isArray(pData.subs)) {
+                pData.subs.forEach(function(sub) {
+                  if (sub && sub.src) {
+                    subtitles.push({
+                      id:       sub.sid || 'tr',
+                      url:      sub.src,
+                      file:     sub.src,
+                      lang:     sub.lang === 'tr' ? 'tur' : 'eng',
+                      language: sub.lang || 'tr',
+                      label:    sub.label || 'Türkçe',
+                      title:    sub.label || 'Türkçe',
+                      format:   'vtt',
+                      type:     'text/vtt'
+                    });
+                  }
+                });
+              }
+
+              var liveStreams = [];
+              var streamHeaders = {
+                'Referer':    PLAYER_HOST + '/',
+                'User-Agent': HEADERS['User-Agent']
+              };
+
+              var audios = Array.isArray(pData.audios) && pData.audios.length > 0
+                ? pData.audios
+                : [{ label: 'Türkçe Dublaj' }];
+
+              audios.forEach(function(aud) {
+                var sObj = {
+                  name:    'FilmModu',
+                  title:   (aud.label || 'Türkçe Dublaj') + ' • 1080p FHD',
+                  url:     pData.stream,
+                  quality: '1080p',
+                  type:    'hls',
+                  format:  'hls',
+                  isHls:   true,
+                  headers: streamHeaders,
+                  behaviorHints: {
+                    notWebReady: true,
+                    proxyHeaders: { request: streamHeaders }
+                  }
+                };
+                if (subtitles.length > 0) {
+                  sObj.subtitles = subtitles;
+                }
+                liveStreams.push(sObj);
+              });
+
+              console.log('[FilmModu.live] Çözülen akış sayısı: ' + liveStreams.length);
+              return liveStreams;
+            });
+        });
+    })
+    .catch(function(err) {
+      console.log('[FilmModu.live] Arama hatası: ' + err.message);
+      return [];
+    });
+}
+
+// ── Ana fonksiyon ────────────────────────────────────────────
+function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
+  if (typeof tmdbId === 'object' && tmdbId && tmdbId.id) {
+    return getStreams(tmdbId.id, mediaType || 'movie', seasonNum, episodeNum);
+  }
+  console.log('[FilmModu] === Başlıyor | TMDB ID: ' + tmdbId + ' ===');
+
+  return fetchTmdbInfo(tmdbId)
+    .then(function(info) {
+      if (!info.titleEn && !info.titleTr) {
+        console.log('[FilmModu] TMDB başlık bulunamadı');
+        return [];
+      }
+
+      console.log('[FilmModu] Film: ' + info.titleEn + ' / ' + info.titleTr + ' (' + info.year + ')');
+
+      // Önce orijinal başlıkla ara, bulamazsa Türkçeyle dene
+      return searchFilmModu(info.titleEn, info.year)
+        .then(function(filmUrl) {
+          if (!filmUrl && info.titleTr && info.titleTr !== info.titleEn) {
+            console.log('[FilmModu] Orijinal başlıkla bulunamadı, Türkçe deneniyor: ' + info.titleTr);
+            return searchFilmModu(info.titleTr, info.year);
+          }
+          return filmUrl;
+        })
+        .then(function(filmUrl) {
+          if (!filmUrl) {
+            console.log('[FilmModu] filmmodu.one üzerinde bulunamadı, filmmodu.live deneniyor...');
+            return fetchStreamsFromLive(info.titleEn, info.year).then(function(lStreams) {
+              if (lStreams && lStreams.length > 0) return lStreams;
+              if (info.titleTr && info.titleTr !== info.titleEn) {
+                return fetchStreamsFromLive(info.titleTr, info.year);
+              }
+              return [];
+            });
+          }
+
+          return fetchAlternateLinks(filmUrl)
+            .then(function(altLinks) {
+              if (altLinks.length === 0) return [];
+              return Promise.all(altLinks.map(function(alt) {
+                return fetchStreamsFromAlt(alt, filmUrl);
+              })).then(function(results) {
+                var allStreams = [];
+                var seen = new Set();
+                results.forEach(function(arr) {
+                  if (arr && arr.length > 0) {
+                    arr.forEach(function(s) {
+                      if (s && s.url && !seen.has(s.url)) {
+                        seen.add(s.url);
+                        allStreams.push(s);
+                      }
+                    });
+                  }
+                });
+                return allStreams;
+              });
+            })
+            .then(function(validStreams) {
+              if (validStreams && validStreams.length > 0) {
+                console.log('[FilmModu] Toplam doğrulanmış canlı stream: ' + validStreams.length);
+                return validStreams;
+              }
+              // filmmodu.one üzerinde tüm stream'ler 503/ölü ise filmmodu.live yedek ağını dene
+              console.log('[FilmModu] filmmodu.one üzerinde canlı stream bulunamadı, filmmodu.live deneniyor...');
+              return fetchStreamsFromLive(info.titleEn, info.year).then(function(lStreams) {
+                if (lStreams && lStreams.length > 0) return lStreams;
+                if (info.titleTr && info.titleTr !== info.titleEn) {
+                  return fetchStreamsFromLive(info.titleTr, info.year);
+                }
+                return [];
+              });
+            });
+        });
+    })
+    .catch(function(err) {
+      console.error('[FilmModu] Genel hata: ' + err.message);
+      return [];
+    });
+}
+
+
+// ── Dışa aktarma: akışlar kaliteye göre sıralanır ────────────
+var _rawGetStreams = getStreams;
+async function getStreamsSorted() {
+  var res = await _rawGetStreams.apply(this, arguments);
+  return sortStreamsByQuality(res);
 }
 
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { getStreams: getStreams };
-} else {
-  global.getStreams = getStreams;
+  module.exports = { getStreams: getStreamsSorted };
+} else if (typeof globalThis !== 'undefined') {
+  globalThis.getStreams = getStreamsSorted;
 }
