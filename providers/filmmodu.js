@@ -52,7 +52,7 @@ function debugStream(msg) {
   console.log('[Filmmodu] ' + msg);
   if (!DEBUG) return [];
   return [{
-    name: 'Filmmodu ⚠ ' + msg.slice(0, 80),
+    name: 'Filmmodu ⚠ ' + msg.slice(0, 210),
     title: '⚠ ' + msg,
     url: 'https://example.com/debug.m3u8',
     quality: 'Auto',
@@ -127,34 +127,94 @@ async function probe(url) {
   return 'm3u h:' + d(a) + ' n:' + d(b) + ' v' + v + ' s' + seg;
 }
 
-// Link bulunamazsa: sayfadaki ipuçlarını kısa satırlar halinde listeye yazar
+// Film sayfasını bulur: önce adres tahmini, olmazsa sitenin kendi araması (POST /arama/)
+async function findFilmPage(title, origTitle, year) {
+  var tr = slugify(title), en = slugify(origTitle);
+  var tried = [], seenTitle = '', codes = [];
+
+  async function tryPaths(slugs) {
+    slugs = slugs.filter(function (x, i) { return x && slugs.indexOf(x) === i && tried.indexOf(x) === -1; });
+    slugs.forEach(function (x) { tried.push(x); });
+    var pages = await Promise.all(slugs.map(function (x) {
+      return req(PRIMARY_DOMAIN + '/film/' + x + '/', { headers: PAGE_HEADERS });
+    }));
+    for (var i = 0; i < pages.length; i++) {
+      codes.push(pages[i].status);
+      if (pages[i].status !== 200 || !pages[i].text) continue;
+      if (!seenTitle) seenTitle = pageTitle(pages[i].text);
+      if (isRightMovie(pages[i].text, title, origTitle, year)) return { html: pages[i].text, slug: slugs[i] };
+    }
+    return null;
+  }
+
+  // 1) Adres tahmini: bazı filmlerde sonunda -izle var
+  var guesses = [tr, tr + '-izle', en, en + '-izle'];
+  if (tr && en && tr !== en) { guesses.push(tr + '-' + en + '-izle'); guesses.push(tr + '-' + en); }
+  if (en && year) { guesses.push(en + '-izle-' + year); guesses.push(en + '-' + year); }
+  if (tr && year) { guesses.push(tr + '-' + year); guesses.push(tr + '-izle-' + year); }
+  var hit = await tryPaths(guesses.slice(0, 9));
+  if (hit) return hit;
+
+  // 2) Sitenin araması: POST /arama/  action=ajax_search&arama_kelime=...
+  STEP = 'arama';
+  var qs = [];
+  [title, origTitle].forEach(function (q) { if (q && qs.indexOf(q) === -1) qs.push(q); });
+  var sres = await Promise.all(qs.map(function (q) {
+    return req(PRIMARY_DOMAIN + '/arama/', {
+      method: 'POST',
+      headers: {
+        'User-Agent': ANDROID_UA,
+        'Accept': '*/*',
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Origin': PRIMARY_DOMAIN,
+        'Referer': PRIMARY_DOMAIN + '/'
+      },
+      body: 'action=ajax_search&arama_kelime=' + encodeURIComponent(q)
+    });
+  }));
+  var slugs = [];
+  sres.forEach(function (r) {
+    var txt = r.text.replace(/\\\//g, '/');
+    var re = /\/film\/([a-z0-9\-]+)\/?/g, m;
+    while ((m = re.exec(txt)) !== null) { if (slugs.indexOf(m[1]) === -1) slugs.push(m[1]); }
+  });
+  hit = await tryPaths(slugs.slice(0, 8));
+  if (hit) return hit;
+
+  return { html: '', note: 'film sayfası yok (' + tr + ' ' + codes.slice(0, 3).join('/') + '), arama: ' +
+    sres.map(function (r) { return r.status + '/' + slugs.length; }).join(' ') +
+    (seenTitle ? ', başlık tutmadı: ' + seenTitle : '') };
+}
+
+// Link bulunamazsa: sayfadaki video yükleme kodunu listeye yazar
 function discoverStreams(html, slug) {
   var t = String(html || '').replace(/\\\//g, '/');
-  var lines = ['sayfa ' + slug + ': m3u yok, vidmixi:' + (/vidmixi/i.test(t) ? 'var' : 'yok')];
-  function chunks(label, text, n) {
-    text = text.replace(/\s+/g, ' ');
-    for (var k = 0; k < n && k * 72 < text.length; k++) {
-      lines.push(label + k + ': ' + text.slice(k * 72, (k + 1) * 72));
-    }
+  var lines = ['sayfa ' + slug + ': m3u yok'];
+  var re = /\.open\s*\(\s*['"]post['"]\s*,\s*([^,)]{0,140})/gi, m, n = 0, seen = {};
+  while ((m = re.exec(t)) !== null && n < 3) {
+    if (/arama/.test(m[1])) continue;
+    var key = t.slice(m.index, m.index + 60);
+    if (seen[key]) continue;
+    seen[key] = true; n++;
+    var pre = n === 1 ? t.slice(Math.max(0, m.index - 260), m.index).replace(/\s+/g, ' ') : '';
+    if (pre) lines.push('önce: ' + pre.slice(-200));
+    var chunk = t.slice(m.index, m.index + 560).replace(/\s+/g, ' ');
+    lines.push('post' + n + 'a: ' + chunk.slice(0, 190));
+    lines.push('post' + n + 'b: ' + chunk.slice(190, 380));
+    lines.push('post' + n + 'c: ' + chunk.slice(380));
   }
-  var xi = t.indexOf('XMLHttpRequest');
-  if (xi > -1) chunks('xhr', t.slice(Math.max(0, xi - 60), xi + 420), 6);
-  else lines.push('xhr yok');
-  (t.match(/\.open\s*\([^)]{0,90}\)/g) || []).slice(0, 3).forEach(function (o) { lines.push('open: ' + o.replace(/\s+/g, ' ')); });
-  var eps = [], er = /['"`](\/[a-z0-9_\-\/\.?=&]{3,70})['"`]/gi, em;
-  while ((em = er.exec(t)) !== null && eps.length < 12) {
-    if (/\.(css|js|png|jpg|jpeg|webp|svg|ico|gif|woff2?)(\?|$)/i.test(em[1]) || /^\/(assets|uploads|film|yil|filmizle)\b/.test(em[1])) continue;
-    if (eps.indexOf(em[1]) === -1) eps.push(em[1]);
-  }
-  for (var k = 0; k < eps.length; k += 3) lines.push('yol: ' + eps.slice(k, k + 3).join('  '));
-  var gi = t.indexOf('gruphtmls[0]');
-  if (gi > -1) {
-    var ge = t.indexOf("</li>'", gi);
-    chunks('g', t.slice(ge > -1 ? ge + 6 : gi, (ge > -1 ? ge + 6 : gi) + 400), 5);
-  }
-  var vi = t.indexOf('vr_set');
-  if (vi > -1) chunks('vr', t.slice(Math.max(0, vi - 80), vi + 140), 3);
-  return lines.slice(0, 26).map(function (l) { return debugStream(l)[0]; });
+  if (!n) lines.push('post isteği bulunamadı');
+  var acts = [];
+  (t.match(/action=[a-z_0-9]+/gi) || []).forEach(function (a) { if (acts.indexOf(a) === -1) acts.push(a); });
+  lines.push('actions: ' + (acts.join(' ') || 'yok'));
+  var sel = [], r2 = /\$on\(document\.body,\s*'click',\s*'([^']+)'/g, m2;
+  while ((m2 = r2.exec(t)) !== null) { if (sel.indexOf(m2[1]) === -1) sel.push(m2[1]); }
+  lines.push('click: ' + (sel.join(' ') || 'yok'));
+  (t.match(/<(?:li|a|div)[^>]*data-(?:fid|pid|id|video)[^>]*>/g) || []).slice(0, 4).forEach(function (x) {
+    lines.push('btn: ' + x.slice(0, 190));
+  });
+  return lines.slice(0, 24).map(function (l) { return debugStream(l)[0]; });
 }
 
 async function run(tmdbId, mediaType) {
@@ -170,34 +230,10 @@ async function run(tmdbId, mediaType) {
     var year = (info.release_date || '').slice(0, 4);
     if (!title && !origTitle) return debugStream('TMDB boş, HTTP ' + t.status + (t.err ? ' ' + t.err : ''));
 
-    // Film adresi: /film/ad/ — bazı filmlerde sonunda -izle var
     STEP = 'sayfa';
-    var tr = slugify(title), en = slugify(origTitle);
-    var slugs = [];
-    function add(s) { if (s && slugs.indexOf(s) === -1) slugs.push(s); }
-    add(tr); add(tr + '-izle'); add(en); add(en + '-izle');
-    if (tr && en && tr !== en) { add(tr + '-' + en + '-izle'); add(tr + '-' + en); }
-    if (en && year) { add(en + '-izle-' + year); add(en + '-' + year); }
-    if (tr && year) { add(tr + '-' + year); add(tr + '-izle-' + year); }
-    slugs = slugs.slice(0, 9);
-
-    var pages = await Promise.all(slugs.map(function (s) {
-      return req(PRIMARY_DOMAIN + '/film/' + s + '/', { headers: PAGE_HEADERS });
-    }));
-
-    var html = '', pageSlug = '', seenTitle = '';
-    for (var i = 0; i < pages.length; i++) {
-      if (pages[i].status !== 200 || !pages[i].text) continue;
-      if (!seenTitle) seenTitle = pageTitle(pages[i].text);
-      if (isRightMovie(pages[i].text, title, origTitle, year)) {
-        html = pages[i].text; pageSlug = slugs[i]; break;
-      }
-    }
-    if (!html) {
-      var codes = pages.slice(0, 3).map(function (p) { return p.status; }).join('/');
-      return debugStream('film sayfası yok (' + slugs[0] + ' ' + codes + ')' +
-                         (seenTitle ? ', başlık tutmadı: ' + seenTitle : ''));
-    }
+    var found = await findFilmPage(title, origTitle, year);
+    if (!found.html) return debugStream(found.note);
+    var html = found.html, pageSlug = found.slug;
 
     // m3u bağlantıları
     STEP = 'm3u';
