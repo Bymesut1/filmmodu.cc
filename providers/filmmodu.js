@@ -96,11 +96,13 @@ function makeVariants(url, tag) {
   var host = (url.match(/^https?:\/\/[^\/]+/) || [''])[0];
   var full = { 'User-Agent': ANDROID_UA, 'Referer': PRIMARY_DOMAIN + '/', 'Origin': PRIMARY_DOMAIN };
   var slim = { 'User-Agent': ANDROID_UA, 'Referer': host + '/' };
-  function mk(suffix, type, headers) {
+  // Uzantısız adrese ".m3u8" izi ekler (bazı oynatıcılar türü adrese bakarak anlar)
+  var tagged = url + (url.indexOf('?') > -1 ? '&' : '?') + 'ext=.m3u8';
+  function mk(suffix, type, headers, u) {
     return {
       name: 'Filmmodu' + tag + suffix,
       title: '⌜ FILMMODU ⌟ | HLS' + suffix,
-      url: url,
+      url: u || url,
       quality: 'Auto',
       type: type,
       headers: headers
@@ -108,6 +110,7 @@ function makeVariants(url, tag) {
   }
   return [
     mk('', 'hls', full),
+    mk(' (.m3u8 ek)', 'hls', slim, tagged),
     mk(' (başlıksız)', 'hls', {}),
     mk(' (m3u8)', 'm3u8', slim)
   ];
@@ -125,22 +128,33 @@ async function probe(url) {
 }
 
 // Link bulunamazsa: sayfadaki ipuçlarını kısa satırlar halinde listeye yazar
-function discoverStreams(html, notes, slug) {
+function discoverStreams(html, slug) {
   var t = String(html || '').replace(/\\\//g, '/');
   var lines = ['sayfa ' + slug + ': m3u yok, vidmixi:' + (/vidmixi/i.test(t) ? 'var' : 'yok')];
-  notes.forEach(function (n) { lines.push(n); });
-  var i = t.indexOf('var partgrupid');
-  if (i > -1) {
-    var chunk = t.slice(i, i + 600).replace(/\s+/g, ' ');
-    for (var k = 0; k < 4 && k * 75 < chunk.length; k++) {
-      lines.push('js' + k + ': ' + chunk.slice(k * 75, (k + 1) * 75));
+  function chunks(label, text, n) {
+    text = text.replace(/\s+/g, ' ');
+    for (var k = 0; k < n && k * 72 < text.length; k++) {
+      lines.push(label + k + ': ' + text.slice(k * 72, (k + 1) * 72));
     }
-  } else {
-    lines.push('pgsec kodu bulunamadı');
   }
-  var calls = t.match(/(?:fetch|\$post|\$get|\$\.ajax|XMLHttpRequest|atob)\s*\([^)]{0,60}/g) || [];
-  calls.slice(0, 3).forEach(function (c) { lines.push('çağrı: ' + c.replace(/\s+/g, ' ')); });
-  return lines.slice(0, 10).map(function (l) { return debugStream(l)[0]; });
+  var xi = t.indexOf('XMLHttpRequest');
+  if (xi > -1) chunks('xhr', t.slice(Math.max(0, xi - 60), xi + 420), 6);
+  else lines.push('xhr yok');
+  (t.match(/\.open\s*\([^)]{0,90}\)/g) || []).slice(0, 3).forEach(function (o) { lines.push('open: ' + o.replace(/\s+/g, ' ')); });
+  var eps = [], er = /['"`](\/[a-z0-9_\-\/\.?=&]{3,70})['"`]/gi, em;
+  while ((em = er.exec(t)) !== null && eps.length < 12) {
+    if (/\.(css|js|png|jpg|jpeg|webp|svg|ico|gif|woff2?)(\?|$)/i.test(em[1]) || /^\/(assets|uploads|film|yil|filmizle)\b/.test(em[1])) continue;
+    if (eps.indexOf(em[1]) === -1) eps.push(em[1]);
+  }
+  for (var k = 0; k < eps.length; k += 3) lines.push('yol: ' + eps.slice(k, k + 3).join('  '));
+  var gi = t.indexOf('gruphtmls[0]');
+  if (gi > -1) {
+    var ge = t.indexOf("</li>'", gi);
+    chunks('g', t.slice(ge > -1 ? ge + 6 : gi, (ge > -1 ? ge + 6 : gi) + 400), 5);
+  }
+  var vi = t.indexOf('vr_set');
+  if (vi > -1) chunks('vr', t.slice(Math.max(0, vi - 80), vi + 140), 3);
+  return lines.slice(0, 26).map(function (l) { return debugStream(l)[0]; });
 }
 
 async function run(tmdbId, mediaType) {
@@ -188,28 +202,7 @@ async function run(tmdbId, mediaType) {
     // m3u bağlantıları
     STEP = 'm3u';
     var links = extractM3u(html);
-    var notes = [];
-    if (!links.length) {
-      // Sayfada hazır link yoksa: ylink.to kısa linklerini izle
-      STEP = 'ylink';
-      var plain = html.replace(/\\\//g, '/').replace(/&amp;/g, '&');
-      var yl = [];
-      (plain.match(/https?:\/\/ylink\.to\/[A-Za-z0-9_\-]+/g) || []).forEach(function (u) {
-        if (yl.indexOf(u) === -1) yl.push(u);
-      });
-      yl = yl.slice(0, 4);
-      var yres = await Promise.all(yl.map(function (u) {
-        return req(u, { headers: { 'User-Agent': ANDROID_UA, 'Referer': PRIMARY_DOMAIN + '/' } });
-      }));
-      yres.forEach(function (r, i2) {
-        var found = extractM3u((r.url || '') + ' ' + r.text);
-        found.forEach(function (u) { if (links.indexOf(u) === -1) links.push(u); });
-        notes.push('ylink ' + yl[i2].replace('https://', '') + ' -> ' + r.status + ' ' +
-                   (r.url || '').replace(/^https?:\/\//, '').slice(0, 40) + (found.length ? ' M3U!' : ''));
-      });
-      if (!yl.length) notes.push('ylink.to linki yok');
-    }
-    if (!links.length) return discoverStreams(html, notes, pageSlug);
+    if (!links.length) return discoverStreams(html, pageSlug);
 
     var streams = [];
     links.forEach(function (u, k) {
